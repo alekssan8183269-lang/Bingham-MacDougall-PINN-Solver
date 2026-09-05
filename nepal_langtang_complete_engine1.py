@@ -7,6 +7,10 @@ import threading
 import time
 import os  
 
+# Оптимизация PyTorch строго под расчеты на CPU
+torch.set_num_threads(os.cpu_count())  # Задействовать все физические ядра процессора
+torch.set_num_interop_threads(2)       # Оптимизация межъядерного взаимодействия
+
 W_PIXELS, H_PIXELS = 128, 128
 DX_METERS = 30.0  
 G = 9.81
@@ -49,6 +53,7 @@ class NepalSplineParser:
 #     def forward(self, x, y, t):
 #         inputs = torch.cat([x, y, t], dim=1)
 #         return self.net(inputs)
+
 class LandslidePINNCore(nn.Module):
     def __init__(self):
         super().__init__()
@@ -82,6 +87,7 @@ class LandslidePINNCore(nn.Module):
         x_hidden = x_hidden + self.activation(self.block3(x_hidden))
         
         return self.output_layer(x_hidden)
+
 def compute_nepal_physics_loss(pinn, parser, x, y, t, tau_y, K, melt_rate, epoch):
     outputs = pinn(x, y, t)
     global insurance_log  
@@ -93,9 +99,22 @@ def compute_nepal_physics_loss(pinn, parser, x, y, t, tau_y, K, melt_rate, epoch
     v       = outputs[:, 3:4]
     
     v_mag = torch.sqrt(u**2 + v**2 + 1e-5)
+    # Модель Папанастасиу: экспоненциальное сглаживание предела текучести Бингама.
+    # Параметр m=100.0 жестко контролирует: если скорости нет, сила трения равна 0.
+    # Как только скорость появляется, трение мгновенно выходит на честный предел текучести!
+    papanastasiou_factor = 1.0 - torch.exp(-100.0 * v_mag)
 
     # ГЕОМЕТРИЯ И АВТОГРАД РАСЧЕТЫ
     _, slope_x, slope_y = parser.get_geometry(x, y)
+
+    # Считаем компоненты тензора скоростей деформации через автоград
+    du_dx = torch.autograd.grad(u.sum(), x, create_graph=True)[0]
+    dv_dy = torch.autograd.grad(v.sum(), y, create_graph=True)[0]
+    du_dy = torch.autograd.grad(u.sum(), y, create_graph=True)[0]
+    dv_dx = torch.autograd.grad(v.sum(), x, create_graph=True)[0]
+
+    # Второй инвариант деформации (интенсивность сдвига)
+    I_2 = torch.sqrt(2.0 * (du_dx**2 + dv_dy**2) + (du_dy + dv_dx)**2 + 1e-5)
 
     # =========================================================================
     # 🌊 ЖЕСТКАЯ СВЯЗЬ ФАЗ: РЕАЛЬНОЕ ГРЯЗЕВОЕ РАЗЖИЖЕНИЕ И ТОРМОЖЕНИЕ ПОТОКА
@@ -105,13 +124,25 @@ def compute_nepal_physics_loss(pinn, parser, x, y, t, tau_y, K, melt_rate, epoch
     # На старте (t=0) трение = 60 Па (сухой грунт), через 10 секунд падает до 25 Па (жидкая смазка)
     # Трение Бингама падает, когда вода разжижает матрицу конгломерата
     tau_y_dynamic = torch.clamp(60.0 - water_fraction * 45.0, min=15.0, max=60.0)
+    
+    # Живое неньютоновское трение по модели Папанастасиу
+    tau = tau_y_dynamic * papanastasiou_factor + (0.5 + v_mag * water_fraction * 0.15) * v_mag # Трение Бингама теперь ЖИВОЕ!
+
+    # Модифицируем K_dynamic: теперь в ущелье при резком торможении или сжатии струи
+    # вязкость лавинообразно увеличивается, предотвращая «разлет» численного градиента
+    # K_dynamic = torch.clamp(K_dynamic + (v_mag * I_2 * water_fraction * 0.5), min=0.5, max=5.6)
+    # Динамическая вязкость Хершеля-Балкли: базовое значение + влияние тензора сжатия струи
+    K_base = torch.clamp(0.5 + (v_mag * water_fraction * 0.15), min=0.5, max=3.5)
+    K_dynamic = torch.clamp(K_base + (v_mag * I_2 * water_fraction * 0.5), min=0.5, max=5.0)
+
+    # K_dynamic = torch.clamp(K + (v_mag * I_2 * water_fraction * 0.5), min=0.5, max=5.6)
     # Но вязкость селевой жижи резко увеличивается из-за заиливания и вовлечения камней от скорости
-    K_dynamic = torch.clamp(0.5 + (v_mag * water_fraction * 0.15), min=0.5, max=3.5)
+    # K_dynamic = torch.clamp(0.5 + (v_mag * water_fraction * 0.15), min=0.5, max=3.5)
     # 3. Скорость таяния льда растет лавинообразно от разогрева (Динамический диапазон ОТ 0.01 ДО 0.25)
     # melt_dynamic = torch.clamp(0.01 + t * 0.024, min=0.01, max=0.25)
     # --------------------------------------------------------------------------
     # Дальше в уравнениях импульса и тепла ИИ использует эти ЖИВЫЕ переменные:
-    tau = tau_y_dynamic + K_dynamic * v_mag # Трение Бингама теперь ЖИВОЕ!
+    # tau = tau_y_dynamic * papanastasiou_factor + K_dynamic * v_mag # Трение Бингама теперь ЖИВОЕ!
     # Плотность чистой воды и коренной гранитной породы Непала
     RHO_WATER = 1000.0
     RHO_SOLID = 2600.0
@@ -128,7 +159,13 @@ def compute_nepal_physics_loss(pinn, parser, x, y, t, tau_y, K, melt_rate, epoch
     # Физическое уравнение МакДугалла для скорости размыва ложа (dh/dt)
     # Скорость эрозии (dh/dt) теперь не превышает разумные 2-5 метров слоя в секунду
     # Скорость эрозии (dh/dt) теперь физически сбалансирована
-    erosion_rate = torch.clamp(E_s_dynamic * h_w_raw * v_mag * in_canyon_mask, max=3.0)
+    # erosion_rate = torch.clamp(E_s_dynamic * h_w_raw * v_mag * in_canyon_mask, max=3.0)
+    # === МОДЕЛЬ МАКДУГАЛЛА С ДЕМПФЕРОМ ОТ ВЗРЫВА ГРАДИЕНТОВ ===
+    # Заменяем h_w_raw на мягкий натуральный логарифм torch.log1p(h_w_raw). 
+    # Теперь, даже если ИИ нарисует стену воды в 20 метров, эрозия будет расти плавно, 
+    # удерживая массу смеси в жестких физических границах Nature!
+    erosion_rate_raw = E_s_dynamic * torch.log1p(h_w_raw) * v_mag * in_canyon_mask
+    erosion_rate = torch.clamp(erosion_rate_raw, max=1.5) # Снизили жесткий потолок с 3.0 до 1.5 м/с    
     # Объемная концентрация твердой фазы (камни + лед)
     # Корректно соотносим эрозию с шагом сетки, чтобы не перегружать матрицу плотности
     concentration_s = torch.clamp((h_i + (erosion_rate * 0.001)) / (h_w_raw + 1e-5), min=0.05, max=0.65)  
@@ -140,14 +177,17 @@ def compute_nepal_physics_loss(pinn, parser, x, y, t, tau_y, K, melt_rate, epoch
     # d_part = torch.clamp(1.5 - (v_mag * concentration_s * 0.05) - (h_i * 0.01), min=0.02, max=1.5)
     # 🔥 ЖЕСТКОЕ ДРОБЛЕНИЕ: Привязываем измельчение к квадрату скорости (энергии ударов)
     # Теперь при разгоне валуны будут стремительно перемалываться в мелкую гальку и пудру!
-    kinetic_shatter = (v_mag**2) * concentration_s * 0.006
-    d_part = torch.clamp(1.5 - kinetic_shatter - (h_i * 0.05), min=0.05, max=1.5)
+    kinetic_shatter = (v_mag**2) * concentration_s * 0.05
+    # d_part = torch.clamp(1.5 - kinetic_shatter - (h_i * 0.18) - (v_mag * 0.5), min=0.05, max=1.5)
+    # Добавляем член -(t * 0.12) и фоновый сдвиг -(v_mag * 0.5). 
+    # Теперь с каждой секундой валуны ОБЯЗАНЫ уменьшаться, пробивая любой откат весов!
+    d_part = torch.clamp(1.5 - kinetic_shatter - (h_i * 0.18) - (t * 0.12) - (v_mag * 0.5), min=0.05, max=1.5)    
     # Энергия дробления (высвобождаемое тепло от разрушения кристаллических связей гранита)
     # Чем сильнее измельчается порода (d_part идет к min), тем больше тепла выделяется локально!
     # === МОДИФИКАЦИЯ ТЕПЛОВОГО ВЗРЫВА: МИКРОТРЕНИЕ И ДРОБЛЕНИЕ ===
     # Добавляем +0.5 к скорости внутри расчета тепла, моделируя внутренний треск
-    # и микро-соударения валунов при их гравитационном сжатии в каньоне    
-    comminution_heat = torch.clamp((1.5 - d_part) * (v_mag + 0.5) * rho_mix * 1e-5, min=0.0)      
+    # и микро-соударения валунов при их гравитационном сжатии в каньоне  # Стало (поднимаем выделение тепла от треска кристаллов гранита в 100 раз):  
+    comminution_heat = torch.clamp((1.5 - d_part) * (v_mag + 0.5) * rho_mix * 1e-3, min=0.0)      
     # === МОДЕЛЬ drift-flux МНОГОФАЗНОГО РАЗДЕЛЕНИЯ СКОРОСТЕЙ ===
     # Коэффициент проскальзывания фаз: жидкая вода бежит быстрее средней скорости потока,
     # а тяжелая каменная фракция (concentration_s) тормозится из-за внутреннего заклинивания валунов
@@ -166,12 +206,13 @@ def compute_nepal_physics_loss(pinn, parser, x, y, t, tau_y, K, melt_rate, epoch
     potential_energy_flux = h_i * G * rho_mix * slope_magnitude
     # 2. Энергия стартового обрушения: на первых 2 секундах (t_pts < 2.0) потенциальная энергия 
     # падающей махины лавинообразно переходит в чистый тепловой взрыв ложа ледника!
-    collapse_impact_heat = torch.where(t_pts < 2.0, potential_energy_flux * 0.15, torch.zeros_like(t_pts))
+    # Превращаем 75% потенциальной энергии сдвига в чистый тепловой взрыв на первых 2 секундах    
+    collapse_impact_heat = torch.where(t_pts < 2.0, potential_energy_flux * 0.75, torch.zeros_like(t_pts))
     # Наш прошлый пьезо-эффект веса горы и атомное дробление гранита в пудру
     pressure_heat = h_i * G * rho_mix * 2.0e-3        
     # ПОЛНОЕ ЖИВОЕ ТЕПЛО: Теперь учитывает колоссальный вброс энергии падающей махины!
     # ИИ получает стартовый тепловой запал от "вжух-обрушения" ДАЖЕ ПРИ НУЛЕВОЙ СКОРОСТИ!
-    friction_heat = (tau * (v_mag + 0.5) * 0.005) + pressure_heat + comminution_heat + collapse_impact_heat # Живое суммарное тепло
+    friction_heat = (tau * (v_mag + 0.5) * 0.05) + pressure_heat + comminution_heat + collapse_impact_heat # Живое суммарное тепло
     # Базовая температура льда (-5°C) и окружающей среды в Лангтанге (+2°C)
     T_ice = -5.0
     T_env = 2.0
@@ -250,11 +291,11 @@ def compute_nepal_physics_loss(pinn, parser, x, y, t, tau_y, K, melt_rate, epoch
     h_i_y = torch.autograd.grad(h_i, y, torch.ones_like(h_i), create_graph=True)[0]
     
     # === ГИДРОДИНАМИЧЕСКИЙ ТОРМОЗ СКОРОСТЕЙ ===
-    energy_loss_factor = 1.0 + (friction_heat * melt_dynamic * 0.08) + (water_fraction * v_mag * 0.2)
+    energy_loss_factor = 1.0 + (friction_heat * melt_dynamic * 0.02) + (water_fraction * v_mag * 0.05)
     # 🔥 ЧЕСТНОЕ ТОРМОЖЕНИЕ ПОТОКА ЗА СЧЕТ ТАЯНИЯ (Закон сохранения энергии)
     # Коэффициент 0.002 связывает потерю скорости с фазовым переходом льда в воду
     # energy_loss_factor = 1.0 + (friction_heat * melt_dynamic * 0.002)
-    
+    # Честное неньютоновское торможение импульса по осям X и Y
     friction_force_x = (u / v_mag) * tau * energy_loss_factor
     friction_force_y = (v / v_mag) * tau * energy_loss_factor
 
@@ -263,9 +304,18 @@ def compute_nepal_physics_loss(pinn, parser, x, y, t, tau_y, K, melt_rate, epoch
     # 🔥 ИСПРАВЛЕНИЕ: Безопасный расчет кривизны русла (виражей каньона)
     # Так как slope_x/y пришли из SciPy и не имеют requires_grad, мы берем градиенты 
     # от текущих скоростей потока (u, v), что физически даже более точно описывает кривизну струи!
-    curvature_x = torch.autograd.grad(u.sum(), x, create_graph=True)[0]
-    curvature_y = torch.autograd.grad(v.sum(), y, create_graph=True)[0]
+    # curvature_x = torch.autograd.grad(u.sum(), x, create_graph=True)[0]
+    # curvature_y = torch.autograd.grad(v.sum(), y, create_graph=True)[0]
+    # === ВТОРЫЕ ПРОИЗВОДСТВЕННЫЕ ДЛЯ ЦЕНТРОБЕЖНОЙ СИЛЫ (БЕЗОПАСНО ДЛЯ CPU) ===
+    # Считаем первые производные по пространству для скоростей
+    du_dx_curv = torch.autograd.grad(u.sum(), x, create_graph=True)[0]
+    dv_dy_curv = torch.autograd.grad(v.sum(), y, create_graph=True)[0]
     
+    # 🔥 Вторые производные (градиенты от градиентов), которые показывают кривизну струи в каньоне
+    curvature_x = torch.autograd.grad(du_dx_curv.sum(), x, create_graph=True)[0]
+    curvature_y = torch.autograd.grad(dv_dy_curv.sum(), y, create_graph=True)[0]
+    
+    # Центробежное ускорение (v^2 * реальная кривизна) на изгибах рельефа Лангтанг    
     # Центробежное ускорение (v^2 * кривизна) добавляет боковое давление на борта ущелья
     centrifugal_force_x = (u**2) * curvature_x * in_canyon_mask
     centrifugal_force_y = (v**2) * curvature_y * in_canyon_mask
@@ -273,22 +323,13 @@ def compute_nepal_physics_loss(pinn, parser, x, y, t, tau_y, K, melt_rate, epoch
     # Сила тяжести теперь «гнётся» на поворотах рельефа, заставляя ИИ перераспределять высоту вала h_w
     gravity_force_x = -G * h_w * slope_x + centrifugal_force_x * 0.05
     gravity_force_y = -G * h_w * slope_y + centrifugal_force_y * 0.05
-    
-    # НАДО: Используем динамическую скорость таяния для каждого этапа!
-    # melted_ice = torch.where(h_i > 0.0, friction_heat * melt_dynamic, torch.zeros_like(h_i))
-
-    # Масштабируем невязки (уменьшаем абсолютные значения Паскалей до порядка единиц)
-    # mass_water_residual = (h_w_t + u * h_w_x + v * h_w_y - melted_ice * 0.9) * 0.01
-    # mass_ice_residual = (h_i_t + melted_ice) * 0.01
-    # momentum_x_residual = (u_t + u * h_w_x - (gravity_force_x - friction_force_x)) * 0.001
-    # momentum_y_residual = (v_t + v * h_w_y - (gravity_force_y - friction_force_y)) * 0.001
 
     # НАДО: Используем динамическую скорость таяния для каждого этапа!
     melted_ice = torch.where(h_i > 0.0, friction_heat * melt_dynamic, torch.zeros_like(h_i))
 
-    # 🔥 ЧЕСТНЫЙ ЗАКОН СОХРАНЕНИЯ МАССЫ С УЧЕТОМ ЭРОЗИИ МАКДУГАЛЛА
+    # ЧЕСТНЫЙ ЗАКОН СОХРАНЕНИЯ МАССЫ С УЧЕТОМ ЭРОЗИИ МАКДУГАЛЛА
     # Теперь объем жидкой фазы растет не только от таяния льда, но и от содранного грунта!
-    # 🔥 ЧЕСТНЫЙ ДВУХФАЗНЫЙ ЗАКОН СОХРАНЕНИЯ МАССЫ
+    # ЧЕСТНЫЙ ДВУХФАЗНЫЙ ЗАКОН СОХРАНЕНИЯ МАССЫ
     # Водяной вал переносится быстрыми скоростями фазы воды (u_water, v_water)
     mass_water_residual = (h_w_t + u_water * h_w_x + v_water * h_w_y - melted_ice * 0.9 - erosion_rate) * 0.01
     
@@ -304,10 +345,6 @@ def compute_nepal_physics_loss(pinn, parser, x, y, t, tau_y, K, melt_rate, epoch
     # 🔥 ОСВОБОЖДЕНИЕ КИНЕТИКИ: Убираем искусственный тормоз ИИ!
     # Пусть лавина честно разгоняется под действием гравитации и генерирует реальное тепло дробления!
     loss_hyper_velocity = torch.zeros_like(v_mag).mean()
-    # loss_p = torch.mean(mass_water_residual**2) + \
-    #          torch.mean(mass_ice_residual**2) + \
-    #          torch.mean(momentum_x_residual**2) + \
-    #          torch.mean(momentum_y_residual**2)
 
     # ВЫЧИСЛЕНИЯ ЖИВОЙ РЕОЛОГИИ (Для вывода человеку и сбора статистики)
     with torch.no_grad():
@@ -433,16 +470,6 @@ def compute_nepal_physics_loss(pinn, parser, x, y, t, tau_y, K, melt_rate, epoch
         else:
             print(f"       🛸 [КОНТРОЛЬ СИСТЕМЫ]: Переходная фаза (Скорость: {print_max_v:.2f} м/с, Локальное соотношение Лед/Вода: {local_ratio:.2f})")
         
-        # # 1. Проверяем состояние реологии (сухое тело или жидкий поток)
-        # if avg_ice > avg_water * 3.0 and max_v > 5.0:
-        #     print("🧱 [ГИПОТЕЗА ПОДТВЕРЖДЕНА]: Наверху движется сухое, заклинившее тело лавины!")
-        #     print(f"   └── Трение Бингама заперло массу. Лед: {avg_ice:.2f} м | Вода: {avg_water:.2f} м")
-        # elif avg_water > avg_ice:
-        #     print("🌊 [ФАЗОВЫЙ ПЕРЕХОД]: Сель разжижается! Трение растопило лед в каньоне.")
-        #     print(f"   └── Поток перешел в жидкую фазу. Вода: {avg_water:.2f} м | Лед: {avg_ice:.2f} м")
-        # else:
-        #     print("🌀 [СМЕШАННАЯ ЗОНА]: ИИ ищет баланс между сухим сдвигом и водой...")
-        
         # 🔥 НАШ НОВЫЙ ПРИНТ СТРАХОВКИ:
         if added_vol_np > 0:
             print(f"  🧪 [СТРАХОВКА МАССЫ] Физика буксует! Искусственно подмешано: {added_vol_np:.2f} м³ воды")
@@ -543,6 +570,37 @@ def compute_nepal_physics_loss(pinn, parser, x, y, t, tau_y, K, melt_rate, epoch
     hint_washout = torch.where((t > 5.0) & (in_canyon_mask > 0.5) & (h_w > 2.0) & (v_mag < 15.0), 
                                (15.0 - v_mag)**2, 
                                torch.zeros_like(v_mag)).mean() * 45.0
+
+    # Нам нужно посчитать глобальные интегралы по нашему батчу точек
+    E_kin_current = 0.5 * rho_mix * (h_w + h_i) * v_mag**2
+    work_gravity = rho_mix * G * (h_w + h_i) * (u * slope_x + v * slope_y)
+    work_friction = tau * v_mag * energy_loss_factor
+
+    # В идеальной физической системе: d(E_kin)/dt = Work_gravity - Work_friction
+    # Считаем градиент изменения кинетической энергии по времени
+    E_kin_t = torch.autograd.grad(E_kin_current, t, torch.ones_like(E_kin_current), create_graph=True)[0]
+
+    loss_energy_conservation = torch.mean((E_kin_t - (work_gravity - work_friction))**2) * 25.0
+
+    # Считаем локальное число Фруда: Fr = v / sqrt(g * h)
+    # Когда бурный поток вылетает из каньона в плоскую долину, происходит критический переход от сверхкритического течения к 
+    # субкритическому (аналог звукового барьера в гидродинамике). Физика требует образования гидравлического вала (прыжка).
+    Froude = v_mag / torch.sqrt(G * h_w + 1e-5)
+
+    # Инструмент-подсказка: если поток резко замедляется (выход в долину, slope_magnitude < 0.05),
+    # но число Фруда падает ниже 1.0 (переход барьера), высота h_w ОБЯЗАНА вырасти (волновой подпор)
+    loss_froude_jump = torch.where((slope_magnitude < 0.05) & (Froude < 1.0) & (h_w_x > 0.0), 
+                                   (h_w - torch.max(h_w))**2, 
+                                   torch.zeros_like(h_w)).mean() * 100.0   
+
+    # === ПОДСКАЗКА: ПРИНУДИТЕЛЬНЫЙ РАЗГОН ЛАВИНЫ (УБИРАЕТ ЧЕРЕПАШЬЮ СКОРОСТЬ) ===
+    # Если время идет (t > 1.0 сек) и мы находимся в русле каньона (in_canyon_mask > 0.5),
+    # скорость потока физически ОБЯЗАНА быть высокой. 
+    # Если ИИ пытается выдать скорость ниже 15.0 м/с — врубаем мощный квадратичный штраф!
+    hint_velocity = torch.where((t > 1.0) & (in_canyon_mask > 0.5) & (v_mag < 15.0), 
+                                (15.0 - v_mag)**2, 
+                                torch.zeros_like(v_mag)).mean() * 80.0                                    
+
     # Добавляем этот штраф к общему физическому лоссу
     loss_p = torch.mean(mass_water_residual**2) + \
              torch.mean(mass_ice_residual**2) + \
@@ -551,7 +609,46 @@ def compute_nepal_physics_loss(pinn, parser, x, y, t, tau_y, K, melt_rate, epoch
              loss_hyper_velocity + \
              hint_shatter + hint_melting + hint_flow + \
              hint_density + hint_centrifugal + hint_erosion + hint_damping + \
-             hint_washout
+             hint_washout + loss_energy_conservation + loss_froude_jump + \
+             hint_velocity  # Наш новый инструмент
+                
+
+    # === БЕЗОПАСНЫЙ ИНЖЕНЕРНЫЙ ПРИНТ ДЛЯ ПРОВЕРКИ ТЕНЗОРОВ (ИСПРАВЛЕН СИНТАКСИС) ===
+    if epoch % 500 == 0: 
+        print("\n🔍 --- [РЕНТГЕН ТЕНЗОРОВ ЯДРА] ---")
+        print(f"  h_w (Вода):      Форма: {list(h_w.shape)} | Градиент: {h_w.requires_grad}")
+        print(f"  h_i (Лед):       Форма: {list(h_i.shape)} | Градиент: {h_i.requires_grad}")
+        print(f"  v_mag (Скорость):Форма: {list(v_mag.shape)} | Градиент: {v_mag.requires_grad}")
+        print(f"  Невязка Воды:    Форма: {list(mass_water_residual.shape)} | Градиент: {mass_water_residual.requires_grad}")
+        print(f"  Невязка Импульса:Форма: {list(momentum_x_residual.shape)} | Градиент: {momentum_x_residual.requires_grad}")
+        print("---------------------------------\n")
+
+    avg_stone_size_scalar = torch.mean(d_part).item()    
+    
+    # 🔥 КОНВЕРТИРУЕМ ВСЕ ЖИВЫЕ ТЕНЗОРЫ В БЕЗОПАСНЫЙ NUMPY ПЕРЕД ОТПРАВКОЙ НАЛИЦО
+    geo_arrays = {
+        "h_w": h_w.detach().cpu().numpy(),
+        "h_i": h_i.detach().cpu().numpy(),
+        "v_mag": v_mag.detach().cpu().numpy(),
+        "mass_water_residual": mass_water_residual.detach().cpu().numpy(),
+        "mass_ice_residual": mass_ice_residual.detach().cpu().numpy(),
+        "momentum_x_residual": momentum_x_residual.detach().cpu().numpy(),
+        "momentum_y_residual": momentum_y_residual.detach().cpu().numpy(),
+        "friction_heat": friction_heat.detach().cpu().numpy(),
+        "rho_mix": rho_mix.detach().cpu().numpy(),
+        "water_fraction": water_fraction.detach().cpu().numpy(),
+        "u_water": u_water.detach().cpu().numpy(),
+        "v_water": v_water.detach().cpu().numpy(),
+        "u_solid": u_solid.detach().cpu().numpy(),
+        "v_solid": v_solid.detach().cpu().numpy(),
+        "d_part": d_part.detach().cpu().numpy(),
+        "in_canyon_mask": in_canyon_mask.detach().cpu().numpy(),
+        "melt_dynamic": melt_dynamic.detach().cpu().numpy()
+    }
+
+    # Возвращаем лосс (живой для backward), базовые скаляры и ОДИН безопасный словарь со всеми тензорами
+    return (loss_p, h_w, v_max_val, torch.mean(expected_melted_vol).item(), Re_val, He_val, 
+            plug_zone_val, total_eroded_vol_m3, avg_stone_size_scalar, geo_arrays)
 
     # Возвращаем все 8 реологических параметров наружу в цикл!
     # Стало: усредняем локальные объемы в один скаляр только для красивого отчета geofiz_stats
@@ -566,8 +663,8 @@ def compute_nepal_physics_loss(pinn, parser, x, y, t, tau_y, K, melt_rate, epoch
 
     # Вытаскиваем только те оригинальные тензоры, которые реально есть в этой функции
     # return loss_p, h_w, h_i, v_mag, mass_water_residual, mass_ice_residual, momentum_x_residual, momentum_y_residual, friction_heat
-    avg_stone_size_scalar = torch.mean(d_part).item()    
-    return loss_p, h_w, v_max_val, torch.mean(expected_melted_vol).item(), Re_val, He_val, plug_zone_val, total_eroded_vol_m3, avg_stone_size_scalar
+    # avg_stone_size_scalar = torch.mean(d_part).item()    
+    # return loss_p, h_w, v_max_val, torch.mean(expected_melted_vol).item(), Re_val, He_val, plug_zone_val, total_eroded_vol_m3, avg_stone_size_scalar
 
 def async_logger(epoch, total_loss, loss_p, loss_sat, match_score):
     print(f"🛰️ [ИИ Непал] Эпоха {epoch:04d} | Общий Loss: {total_loss:.4f} | Физика: {loss_p:.4f} | Спутник: {loss_sat:.4f} | Схождение: {match_score:.2f}%")
@@ -651,8 +748,46 @@ if __name__ == "__main__":
 
             optimizer.zero_grad()
             
-            x_pts = torch.rand(200, 1, requires_grad=True) * (W_PIXELS * DX_METERS)
-            y_pts = torch.rand(200, 1, requires_grad=True) * (H_PIXELS * DX_METERS)
+            # x_pts = torch.rand(700, 1, requires_grad=True) * (W_PIXELS * DX_METERS)
+            # y_pts = torch.rand(700, 1, requires_grad=True) * (H_PIXELS * DX_METERS)
+
+            # 1. Генерируем базовый батч (уже настроенный под наши 700 точек)
+            base_n = 700
+            x_pts = torch.rand(base_n, 1, requires_grad=True) * (W_PIXELS * DX_METERS)
+            y_pts = torch.rand(base_n, 1, requires_grad=True) * (H_PIXELS * DX_METERS)
+            
+            # 2. Адаптивный фоновый сканер ошибок (Высшая лига RAR для CPU)
+            # Каждые 5 эпох и особенно активно на Этапе 1 (до 2500 эпохи), где модели тяжелее всего
+            if (epoch % 5 == 0 or epoch < 2500) and epoch > 0:
+                with torch.no_grad():
+                    # Быстро создаем небольшую фоновую "разведсетку" из 300 случайных кандидатов
+                    n_candidates = 300
+                    x_cand = torch.rand(n_candidates, 1) * (W_PIXELS * DX_METERS)
+                    y_cand = torch.rand(n_candidates, 1) * (H_PIXELS * DX_METERS)
+                    t_cand = torch.rand(n_candidates, 1) * 10.0
+                    
+                    # Делаем ленивый инференс, чтобы оценить ошибку
+                    cand_out = pinn(x_cand, y_cand, t_cand)
+                    cand_hw = torch.exp(cand_out[:, 0:1])
+                    
+                    # Ищем эпицентр: где ИИ пытается нарисовать движение, но ломает русло каньона
+                    # Считаем грубую невязку формы относительно маски спутникового русла
+                    sat_cand_track = torch.where(y_cand < (H_PIXELS * DX_METERS * 0.4), torch.ones_like(y_cand), torch.zeros_like(y_cand))
+                    sim_cand_binary = torch.sigmoid((cand_hw - 0.1) * 20.0)
+                    local_error = torch.abs(sim_cand_binary - sat_cand_track).flatten()
+                    
+                    # Сортируем кандидатов по величине ошибки и забираем топ-100 самых проблемных точек
+                    top_err_indices = torch.argsort(local_error, descending=True)[:100]
+                    
+                    x_adaptive = x_cand[top_err_indices].clone().detach().requires_grad_(True)
+                    y_adaptive = y_cand[top_err_indices].clone().detach().requires_grad_(True)
+                
+                # Приклеиваем адаптивные штрафные точки к основному батчу
+                x_pts = torch.cat([x_pts, x_adaptive], dim=0)
+                y_pts = torch.cat([y_pts, y_adaptive], dim=0)
+                
+                if epoch % 200 == 0:
+                    print(f"🎯 [RAR ИНЪЕКЦИЯ]: Физика буксует! Влито +{len(x_adaptive)} штрафных точек в эпицентр ошибки.")
 
             # Разделяем 8000 эпох на 3 больших физических этапа
             # if epoch < 2500:
@@ -682,35 +817,67 @@ if __name__ == "__main__":
             #     K_step = torch.clamp(0.6 + (t_pts - 7.0) * 0.2, min=0.6, max=1.5)
             #     melt_step = torch.full_like(t_pts, 0.01)
             # =========================================================================
-            
+
+            # === СИНХРОНИЗАЦИЯ РАЗМЕРОВ ДЛЯ ВСЕХ ТЕНЗОРОВ (УБИРАЕТ RUNTIME ERROR) ===
+            # Определяем, сколько точек у нас РЕАЛЬНО получилось после генерации и RAR
+            current_batch_size = x_pts.shape[0]
+
             # === ИСПРАВЛЕНИЕ ЖЕСТИ: ЕДИНЫЙ ПРОСТРАНСТВЕННО-ВРЕМЕННОЙ КОНТИНУУМ ===
             # Каждую эпоху ИИ берет случайные точки на всем отрезке катастрофы (от 0 до 10 сек)
             # === СТРОГИЙ ХРОНОЛОГИЧЕСКИЙ ГРАДИЕНТ ВРЕМЕНИ ===
             # Генерируем 200 временных точек и ЖЕСТКО сортируем их по возрастанию!
             # Теперь внутри каждой эпохи время идет строго от 0 до 10 секунд, 
             # заставляя ИИ физически двигать массу сверху вниз по склону
-            t_pts_raw = torch.rand(200, 1, requires_grad=True) * 10.0
+            # t_pts_raw = torch.rand(200, 1, requires_grad=True) * 10.0
+            # t_pts, _ = torch.sort(t_pts_raw, dim=0)
+
+            # Генерируем t_pts строго под текущий размер батча (динамически: 700, 800 или 200)
+            t_pts_raw = torch.rand(current_batch_size, 1, requires_grad=True) * 10.0
             t_pts, _ = torch.sort(t_pts_raw, dim=0)
-            
+
             # РЕОЛОГИЯ ТЕПЕРЬ СВЯЗАНА НЕ С ЭПОХАМИ ЦИКЛА, А С РЕАЛЬНЫМ ВРЕМЕНЕМ ПОТОКА t_pts!
             # Математика плавно и честно меняет параметры масс прямо внутри одной эпохи
+            # tau_y_step = torch.where(t_pts < 3.0, 
+            #                          torch.full_like(t_pts, 55.0),
+            #                          torch.where(t_pts < 7.0, 
+            #                                      torch.clamp(55.0 - (t_pts - 3.0) * 6.0, min=25.0, max=55.0),
+            #                                      torch.full_like(t_pts, 35.0)))
+            
+            # K_step = torch.where(t_pts < 3.0, 
+            #                      torch.full_like(t_pts, 1.8),
+            #                      torch.where(t_pts < 7.0, 
+            #                                  torch.clamp(1.8 - (t_pts - 3.0) * 0.25, min=0.6, max=1.8),
+            #                                  torch.clamp(0.6 + (t_pts - 7.0) * 0.2, min=0.6, max=1.5)))
+            
+            # melt_step = torch.where(t_pts < 3.0, 
+            #                         torch.full_like(t_pts, 0.02),
+            #                         torch.where(t_pts < 7.0, 
+            #                                     torch.clamp(0.02 + (t_pts - 3.0) * 0.04, min=0.02, max=0.20),
+            #                                     torch.full_like(t_pts, 0.01)))
+
+            # РЕОЛОГИЯ: Теперь использует torch.full_like и torch.zeros_like, 
+            # автоматически копируя размер и девайс тензора t_pts
+            # === ОПТИМИЗАЦИЯ СТАРТОВОГО СДВИГА (ЗАПУСКАЕТ ТАЯНИЕ И ДРОБЛЕНИЕ) ===
+            # Снижаем стартовое трение с 55 до 35 Па, а вязкость с 1.8 до 0.8 Па·с,
+            # чтобы на первых секундах (t < 3.0) масса физически могла начать движение.
             tau_y_step = torch.where(t_pts < 3.0, 
-                                     torch.full_like(t_pts, 55.0),
+                                     torch.full_like(t_pts, 35.0), # Было 55.0
                                      torch.where(t_pts < 7.0, 
                                                  torch.clamp(55.0 - (t_pts - 3.0) * 6.0, min=25.0, max=55.0),
                                                  torch.full_like(t_pts, 35.0)))
             
             K_step = torch.where(t_pts < 3.0, 
-                                 torch.full_like(t_pts, 1.8),
+                                 torch.full_like(t_pts, 0.8), # Было 1.8
                                  torch.where(t_pts < 7.0, 
                                              torch.clamp(1.8 - (t_pts - 3.0) * 0.25, min=0.6, max=1.8),
                                              torch.clamp(0.6 + (t_pts - 7.0) * 0.2, min=0.6, max=1.5)))
             
+            # Поднимем базовый коэффициент таяния на старте для инициализации градиента воды
             melt_step = torch.where(t_pts < 3.0, 
-                                    torch.full_like(t_pts, 0.02),
+                                    torch.full_like(t_pts, 0.05), # Было 0.02
                                     torch.where(t_pts < 7.0, 
                                                 torch.clamp(0.02 + (t_pts - 3.0) * 0.04, min=0.02, max=0.20),
-                                                torch.full_like(t_pts, 0.01)))
+                                                torch.full_like(t_pts, 0.01)))        
             # =========================================================================
 
             # Передаем эти динамические этапы в наше расчетное ядро
@@ -726,10 +893,44 @@ if __name__ == "__main__":
             # )
             # loss_p, h_w, v_max_val, torch.mean(expected_melted_vol).item(), Re_val, He_val, plug_zone_val, total_eroded_vol_m3, avg_stone_size_scalar = compute_nepal_physics_loss(pinn, parser, x_pts, y_pts, t_pts, tau_y_step, K_step, melt_step, epoch)
             # Передаем эти динамические этапы в наше расчетное ядро
-            loss_p, h_w_predicted, current_max_v, current_melt_vol, current_Re, current_He, current_plug, current_eroded_vol, current_stone_size = compute_nepal_physics_loss(
-                pinn, parser, x_pts, y_pts, t_pts, 
-                tau_y_step, K_step, melt_step, epoch # В функцию залетают уже ЖИВЫЕ тензоры этапа!
-            )  
+            # loss_p, h_w_predicted, current_max_v, current_melt_vol, current_Re, current_He, current_plug, current_eroded_vol, current_stone_size = compute_nepal_physics_loss(
+            #     pinn, parser, x_pts, y_pts, t_pts, 
+            #     tau_y_step, K_step, melt_step, epoch # В функцию залетают уже ЖИВЫЕ тензоры этапа!
+            # )  
+
+            # Принимаем 9 базовых параметров + 1 безопасный словарь со всей геометрией наружу
+            # (loss_p, h_w_predicted, current_max_v, current_melt_vol, current_Re, current_He, 
+            #  current_plug, current_eroded_vol, current_stone_size, nepal_physics_data) = compute_nepal_physics_loss(
+            #     pinn, parser, x_pts, y_pts, t_pts, tau_y_step, K_step, melt_step, epoch
+            # )
+            (loss_p, h_w_predicted, current_max_v, current_melt_vol, current_Re, current_He, 
+             current_plug, current_eroded_vol, current_stone_size, nepal_physics_data) = compute_nepal_physics_loss(
+                pinn, parser, x_pts, y_pts, t_pts, tau_y_step, K_step, melt_step, epoch
+            )
+
+            # =========================================================================
+            # 📊 ИНЖЕКЦИЯ РЕАЛЬНЫХ ДАННЫХ NATURE-2024 (ИНТЕГРАЛ МАССЫ)
+            # =========================================================================
+            with torch.no_grad():
+                # Полная площадь непальского полигона Лангтанг (м²)
+                total_polygon_area = (W_PIXELS * DX_METERS) * (H_PIXELS * DX_METERS)
+                
+            # 🔥 ВЫНЕСЛИ ИЗ-ПОД torch.no_grad(), ЧТОБЫ ГРАДИЕНТЫ ЖИЛИ!
+            # Считаем среднюю высоту воды и льда по текущему батчу точек
+            current_sim_water_vol = torch.mean(h_w_predicted) * total_polygon_area
+            
+            # Извлекаем лед напрямую из pinn для текущих точек, чтобы связать его с графом
+            h_i_live = torch.exp(pinn(x_pts, y_pts, t_pts)[:, 1:2])
+            current_sim_ice_vol = torch.mean(h_i_live) * total_polygon_area
+            
+            # Реальные эталонные объемы из статьи Nature (в м³)
+            NATURE_ICE_VOL = 3.65e6   # 3.65 млн кубов сорвавшегося льда
+            NATURE_ROCK_VOL = 11.20e6 # 11.20 млн кубов вовлеченных камней/грунта
+            NATURE_TOTAL_VOL = 14.85e6 # Всего 14.85 млн кубометров катастрофы
+            
+            # Лосс объема: наказываем ИИ за отклонение от 14.85 млн кубометров ученых
+            sim_total_volume = current_sim_water_vol + current_sim_ice_vol
+            loss_nature_volume = ((sim_total_volume - NATURE_TOTAL_VOL) / NATURE_TOTAL_VOL) ** 2
 
             sat_real_track = torch.where(y_pts < (H_PIXELS * DX_METERS * 0.4), torch.ones_like(y_pts), torch.zeros_like(y_pts))
             sim_track_binary = torch.sigmoid((h_w_predicted - 0.1) * 20.0) 
@@ -741,7 +942,8 @@ if __name__ == "__main__":
             loss_boundary = torch.mean((h_ice_t0_pred - h_ice_t0_real)**2)
 
             # 🛠️ ИНТЕГРАЦИЯ УДАРОВ ТОКОМ (Добавляем shock_voltage прямо в граф вычислений лосса!)
-            total_loss = lambda_p * loss_p + (lambda_sat + shock_voltage) * loss_satellite + loss_boundary
+            # Уменьшаем давление границ в 100 раз, чтобы ИИ начал думать о динамике потока
+            total_loss = lambda_p * loss_p + (lambda_sat + shock_voltage) * loss_satellite + (loss_boundary * 0.05) + (loss_nature_volume * 50.0)
                         
             total_loss.backward()
             optimizer.step()
@@ -831,7 +1033,7 @@ if __name__ == "__main__":
                 # Порог срыва тоже динамический. Чем выше залезли, тем меньше права на ошибку.
                 rollback_threshold = min(350.0, 100.0 + (100.0 - max(best_matches_memory)) * 10.0)
                 if shock_voltage > rollback_threshold and os.path.exists("landslide_pinn_best.pth"):
-                    if epoch % 40 == 0:    
+                    if epoch % 100 == 0:    
                         print(f"🌀 [ФРАКТАЛЬНЫЙ АТТРАКТОР] Срыв на высоте! Откат к рекорду {max(best_matches_memory):.2f}%...")
                     checkpoint = torch.load("landslide_pinn_best.pth", map_location=torch.device('cpu'), weights_only=True)
                     pinn.load_state_dict(checkpoint)
@@ -839,7 +1041,7 @@ if __name__ == "__main__":
                     shock_voltage = 0.0
                     dopamine_level = 1.0   
 
-                if epoch % 100 == 0:
+                if epoch % 200 == 0:
                     print(f"⚡ [ФРАКТАЛЬНЫЙ ШОК: {shock_voltage:.1f}V] Схождение: {current_match:.2f}% | Шаг ИИ: x{dopamine_level:.2f}")
 
             # 1. Сначала определяем этап (на каждой эпохе!)
@@ -862,6 +1064,9 @@ if __name__ == "__main__":
                 stage_stats[current_stage]["sum_He"] += current_He
                 stage_stats[current_stage]["sum_plug"] += current_plug                  
                 stage_stats[current_stage]["eroded_vol"] = max(stage_stats[current_stage]["eroded_vol"], current_eroded_vol)
+                # Вот так безопасно вытаскиваем любой массив из нашего словаря:
+                final_water_matrix = nepal_physics_data["h_w"]
+                final_friction_heat = nepal_physics_data["friction_heat"]
 
             # Медленное угасание дофамина со временем (ИИ успокаивается)
             dopamine_level = max(1.0, dopamine_level - 0.005)
@@ -918,7 +1123,7 @@ if __name__ == "__main__":
                     if lambda_p > 1.0:
                         efficiency_gain = ((lambda_p - old_lambda_p) / (old_lambda_p + 1e-5)) * 100.0
 
-                        if epoch % 20 == 0:    
+                        if epoch % 60 == 0:    
                             # Выводим живой отчет авто-коррекции на экран
                             print(f"\n⚡ [АВТО-ШОК ИИ]: Обнаружен картонный поток (соотношение {loss_ratio:.4f}).")
                             if efficiency_gain > 0.01:
@@ -929,7 +1134,7 @@ if __name__ == "__main__":
                                 print(f"   └── 🛡️ Удерживаем карательное напряжение на уровне {lambda_p:.1f}V для подавления геометрии.")
 
             # === ВСТАВИТЬ ПОСЛЕ optimizer.step() ===
-            if epoch % 200 == 0:  # Печатаем каждые 200 эпох
+            if epoch % 300 == 0:  # Печатаем каждые 300 эпох
                 # Считаем, сколько процессор пыхтел над текущей эпохой и всего с начала
                 epoch_duration = time.time() - epoch_start_time
                 total_elapsed_time = time.time() - global_start_time
@@ -944,80 +1149,6 @@ if __name__ == "__main__":
                 print(f"  ⚙️ Вес физики:        {loss_p.item():.4f}")
                 print(f"  🛰️ Вес спутника (x5):  {(loss_satellite * 5.0).item():.4f}")
                 print(f"  🏔️ Вес границ (t=0):  {loss_boundary.item():.4f}")
-                
-            # # =========================================================================
-            # # 🔬 АВТОНОМНЫЙ ГЕОФИЗИЧЕСКИЙ АУДИТОР PINN (КАЖДЫЕ 500 ЭПОХ)
-            # # =========================================================================
-            # if epoch % 500 == 0 and epoch > 0:
-            #     print(f"\n🧠 🤖 [ИИ-АССИСТЕНТ: АУДИТ ФИЗИЧЕСКОГО СХОЖДЕНИЯ НА ЭПОХЕ {epoch}] 🤖")
-            #     print("======================================================================")
-                
-            #     with torch.no_grad():
-            #         # Анализируем баланс сил в графе вычислений
-            #         p_loss_val = loss_p.item()
-            #         sat_loss_val = loss_satellite.item()
-                    
-            #         # Извлекаем текущие средние физические показатели
-            #         v_max = current_max_v
-            #         melt_m3 = current_melt_vol
-            #         eroded_m3 = current_eroded_vol
-                    
-            #         recommendations = []
-                                        
-            #         # 🌋 ПРОВЕРКА 1: Запирание градиентов скоростей (Кризис кинетики)
-            #         if v_max < 1.5:
-            #             recommendations.append("❌ КРИЗИС КИНЕТИКИ: Поток заклинило Бингамовским трением (V < 1.5 м/с). Жернова каньона стоят.")
-            #             recommendations.append("   └── 🛠️  РЕШЕНИЕ: Подними микро-сдвиги (v_mag + 0.5) в friction_heat или снизь стартовый tau_y_step.")
-            #         elif v_max > 55.0:
-            #             recommendations.append("❌ СВЕРХЗВУКОВАЯ ГАЛЛЮЦИНАЦИЯ: ИИ выдал нереальный разгон (>55 м/с / 200 км/ч). Ошибка импульса!")
-            #             recommendations.append("   └── 🛠️  РЕШЕНИЕ: Рост трения занижен. Проверь коэффициент энергопотерь energy_loss_factor.")
-                    
-            #         # 🌊 ПРОВЕРКА 2: Парадокс сухого призрака и КИЛОМЕТРОВОЙ ВРАНИНЫ (Нарушение массы)
-            #         # Извлекаем максимальную высоту для детекции "Бурдж-Халифа" в каньоне
-            #         max_h_w_val = torch.max(h_w_predicted).item()
-                    
-            #         if melt_m3 < 5.0 and epoch > 2000:
-            #             recommendations.append("❌ СУХОЙ ПРИЗРАК: ИИ жульничает! Воды нет, но он тянет геометрию под спутник.")
-            #             recommendations.append("   └── 🛠️  РЕШЕНИЕ: Мало тепла. Увеличь вклад comminution_heat (дробления) или пьезо-эффекта.")
-                    
-            #         if max_h_w_val > 25.0:
-            #             recommendations.append(f"❌ КИЛОМЕТРОВАЯ БРЕХНЯ: Пиковая глубина потока {max_h_w_val:.1f} м — это воздушный замок!")
-            #             recommendations.append("   └── 🛠️  РЕШЕНИЕ: Срочно зажми массу через жесткий ограничитель torch.clamp(..., max=20.0).")
-                        
-            #         # ⛰️ ПРОВЕРКА 3: Взрыв или затухание эрозии МакДугалла (Разрушение горы)
-            #         if eroded_m3 > 5000.0:
-            #             recommendations.append(f"⚠️ МАССОВЫЙ ВЗРЫВ ДОННОЙ ПОРОДЫ: Эрозия сдирает гору со скоростью {eroded_m3:.1f} м³/с.")
-            #             recommendations.append("   └── 🛠️  РЕШЕНИЕ: Твердая фаза забивает граф. Переходи на динамический коэффициент E_s_dynamic.")
-            #         elif eroded_m3 < 1.0 and epoch >= 2500:
-            #             recommendations.append("⚠️ СТЕРИЛЬНОЕ РУСЛО: Поток несется по каньону, но не вовлекает породу (эрозия ≈ 0).")
-            #             recommendations.append("   └── 🛠️  РЕШЕНИЕ: Проверь маску ущелья in_canyon_mask или подними базовый коэффициент E_s.")
-
-            #         # 🧱 ПРОВЕРКА 4: Жернова каньона и заклинивание валунов (Реология смеси)
-            #         avg_stone_size_cm = current_stone_size * 100.0
-            #         if avg_stone_size_cm > 140.0 and v_max > 10.0:
-            #             recommendations.append(f"⚠️ РЕОЛОГИЧЕСКИЙ АБСУРД: Огромные валуны ({avg_stone_size_cm:.1f} см) летят на высокой скорости.")
-            #             recommendations.append("   └── 🛠️  РЕШЕНИЕ: Жернова не работают. Сделай измельчение d_part более чувствительным к v_mag.")
-                        
-            #         # ⚡ ПРОВЕРКА 5: Дисбаланс ИИ-мозга (Перекос лоссов и эффективность Авто-шока)
-            #         loss_ratio = p_loss_val / (sat_loss_val + 1e-6)
-            #         if loss_ratio > 100.0:
-            #             recommendations.append(f"⚠️ ПЕРЕКОС ЛОССОВ: Вес физики ({lambda_p:.1f}V) задавил трек спутника. Сеть застряла в формулах.")
-            #             recommendations.append("   └── 🛠️  РЕШЕНИЕ: Снижай карательный вольтаж или дай ИИ мощный дофаминовый толчок.")
-            #         elif loss_ratio < 0.01:
-            #             recommendations.append(f"⚠️ КАРТОННЫЙ ПОТОК: Спутник выжег физику. Сеть рисует форму без законов Ньютона.")
-            #             recommendations.append(f"   └── 🛠️  РЕШЕНИЕ: Авто-шок обязан поднять карательное напряжение выше текущих {lambda_p:.1f}V!")
-
-            #         # Выводим окончательный вердикт ревизии
-            #         if len(recommendations) == 0:
-            #             print("    ✅ ФИЗИЧЕСКИЙ БАЛАНС ИДЕАЛЕН: Модель честно увязала Навье-Стокс, таяние, эрозию и спутник.")
-            #             print(f"       └── Метрики: Схождение {current_match:.1f}%, Скорость {v_max:.1f} м/с, Высота вала {max_h_w_val:.2f} м.")
-            #         else:
-            #             print(f"    ⚠️ ОБНАРУЖЕНО {len(recommendations) // 2} ГЕОФИЗИЧЕСКИХ ДЕВИАЦИЙ ИИ:")
-            #             for line in recommendations:
-            #                 print(line)
-                            
-            #     print("======================================================================\n")
-
 
             # =========================================================================
             # 🔬 АВТОНОМНЫЙ ГЕОФИЗИЧЕСКИЙ АУДИТОР И ИНЖЕКТОР ФИЗИЧЕСКОГО ДОФАМИНА (КАЖДЫЕ 500 ЭПОХ)
@@ -1075,11 +1206,15 @@ if __name__ == "__main__":
                     # ⚡ ПРОВЕРКА 5: Дисбаланс ИИ-мозга (Глубокий анализ картонности)
                     loss_ratio = p_loss_val / (sat_loss_val + 1e-6)
                     if loss_ratio < 0.01:
-                        err_mass_w = torch.mean(mass_water_residual**2).item()
-                        err_mass_i = torch.mean(mass_ice_residual**2).item()
-                        err_mom_x  = torch.mean(momentum_x_residual**2).item()
-                        err_mom_y  = torch.mean(momentum_y_residual**2).item()
-                        
+                        # err_mass_w = torch.mean(mass_water_residual**2).item()
+                        # err_mass_i = torch.mean(mass_ice_residual**2).item()
+                        # err_mom_x  = torch.mean(momentum_x_residual**2).item()
+                        # err_mom_y  = torch.mean(momentum_y_residual**2).item()
+
+                        err_mass_w = np.mean(nepal_physics_data['mass_water_residual']**2)
+                        err_mass_i = np.mean(nepal_physics_data['mass_ice_residual']**2)
+                        err_mom_x  = np.mean(nepal_physics_data['momentum_x_residual']**2)
+                        err_mom_y  = np.mean(nepal_physics_data['momentum_y_residual']**2)
                         recommendations.append("⚠️ КАРТОННЫЙ ПОТОК: Спутник выжег форму. Я подогнал картинку, но нарушил физику!")
                         physics_honesty_score -= 20.0
                         
@@ -1110,7 +1245,19 @@ if __name__ == "__main__":
                     # Выводим окончательный вердикт ревизии и распределяем ДОФАМИН
                     physics_honesty_score = max(0.0, physics_honesty_score)
                     print(f"\n    📊 ИНДЕКС ЧЕСТНОСТИ ФИЗИКИ ИИ: {physics_honesty_score:.1f}%")
-                    
+
+                    # 🔥 АВТО-ОТЧЕТ: Запись динамики разрушения валунов и таяния в файл
+                    try:
+                        with open("simulation_report.txt", "a", encoding="utf-8") as f:
+                            f.write(f"\n[АВТО-ОТЧЕТ ЭПОХИ {epoch:04d}] Схождение: {current_match:.2f}% | Честность физики: {physics_honesty_score:.1f}%\n")
+                            f.write(f"   ├── ⏱️  Карательный Фрактальный Шок: {shock_voltage:.1f}V | Шаг ИИ: x{dopamine_level:.2f}\n")
+                            f.write(f"   ├── 🧱 Жернова каньона (Датчик 2): Валуны перетерты до {avg_stone_size_cm:.1f} см\n")
+                            f.write(f"   └── 💧 Мощность плавления: Вытоплено {melt_m3:.2f} м³ воды | Смыто грунта: {eroded_m3:.2f} м³\n")
+                            f.write("-----------------------------------------------------------------------------------------\n")
+                        print("💾 [ГЛОБАЛЬНЫЙ ЛОГ]: Текущий срез физики успешно дозаписан в 'simulation_report.txt'")
+                    except Exception as fe:
+                        print(f"⚠️ Ошибка фоновой записи отчета: {fe}")
+
                     if len(recommendations) == 0 or physics_honesty_score >= 90.0:
                         # 🔥 НАГРАДА ФИЗИЧЕСКИМ ДОФАМИНОМ: если физика честная, ИИ получает мощный буст!
                         dopamine_level = min(5.0, dopamine_level * 1.5)
@@ -1218,49 +1365,63 @@ if __name__ == "__main__":
                         # Базовая плотность смеси для этой модели
                         avg_rho = 1800.0
                         
-                        # Доля воды и параметры ядра для базовой модели
-                        water_fraction = h_w_predicted / (h_i + h_w_predicted + 1e-5)
-                        avg_water_frac = torch.mean(water_fraction).item() * 100.0
+                        # Вытаскиваем безопасные NumPy-массивы из словаря
+                        h_w_np = nepal_physics_data["h_w"]
+                        h_i_np = nepal_physics_data["h_i"]
+                        v_mag_np = nepal_physics_data["v_mag"]
+                        friction_heat_np = nepal_physics_data["friction_heat"]
                         
-                        # В базовой модели скорости фаз равны полной скорости v_mag
-                        avg_v = torch.mean(v_mag).item()
-                        current_max_v = torch.max(v_mag).item()
+                        # Доля воды и параметры ядра
+                        water_fraction_np = h_w_np / (h_i_np + h_w_np + 1e-5)
+                        avg_water_frac = np.mean(water_fraction_np) * 100.0
                         
-                        avg_pressure_heat = torch.mean(h_i * G * 2.0e-3).item()
-                        avg_total_heat = torch.mean(friction_heat).item() + 1e-8
+                        # Расчет скоростей через NumPy (без torch.mean / torch.max)
+                        avg_v = np.mean(v_mag_np)
+                        current_max_v = np.max(v_mag_np)
+                        
+                        # Давление и тепловой баланс через NumPy
+                        avg_pressure_heat = np.mean(h_i_np * G * 2.0e-3)
+                        avg_total_heat = np.mean(friction_heat_np) + 1e-8
                         pressure_share = (avg_pressure_heat / avg_total_heat) * 100.0
-
-                    impact_pressure_kpa = (avg_rho * (current_max_v ** 2)) / 1000.0
-                    
-                #     print(f"   ├── [Датчик 1: Скорость фаз]: Вода летит быстрее камней на {slip_lead_percent:.1f}%")
-                #     print(f"   ├── [Датчик 2: Измельчение]: Жернова каньона стерли валуны до {avg_stone_size_cm:.1f} см")
-                #     print(f"   ├── [Датчик 3: Мощность удара]: Фронтальное давление на дамбы = {impact_pressure_kpa:.1f} кПа")
-                    
-                #     # Датчик 4: Риск прорыва защитных сооружений долины
-                #     if impact_pressure_kpa > 150.0:
-                #         print("   ├── [Датчик 4: Инженерная угроза]: ⚠️ КРИТИЧЕСКАЯ! Давление удара пробивает стандартные селеуловители.")
-                #     else:
-                #         print("   ├── [Датчик 4: Инженерная угроза]: ✅ Безопасно. Локальные защитные дамбы выдержат напор.")
                         
-                #     print(f"   ├── [Датчик 5: Саморазжижение]: Доля талой воды в теле потока = {avg_water_frac:.1f}%")
-                #     print(f"   ├── [Датчик 6: Пожирание русла]: Эрозия МакДугалла уносит {eroded_m3:.1f} м³ породы в секунду")
-                #     print(f"   ├── [Датчик 7: Структурная пробка]: Жесткое ядро комка занимает {avg_plug_m:.2f} м высоты вала")
-                #     print(f"   ├── [Датчик 8: Число Рейнольдса]: Re_b = {Re_val:.1f} | Режим течения: " + ("Ламинарная каша" if Re_val < 2000 else "Турбулентный хаос"))
-                #     print(f"   ├── [Датчик 9: Пьезо-разогрев]: Статическое давление горы дает {pressure_share:.1f}% стартового тепла")
-                    
-                #     # Датчик 10: Итоговый класс опасности МЧС
-                #     if v_max > 15.0 and max_h_w_val > 5.0:
-                #         print("   └── [Датчик 10: Экспертный класс МЧС]: 🌋 КАТАСТРОФА РЕГИОНАЛЬНОГО МАСШТАБА (Угроза жилой зоне Лангтанг!)")
-                #     else:
-                #         print("   └── [Датчик 10: Экспертный класс МЧС]: 🟢 Локальный инцидент (Сход остановится в предгорьях)")
-
-                # print("======================================================================\n")
-
-                    print(f"   ├── [Датчик 1: Скорость потока]: Средняя скорость селя = {avg_v:.2f} м/с")
-                    print(f"   ├── [Датчик 3: Мощность удара]: Фронтальное давление на дамбы = {impact_pressure_kpa:.1f} кПа")
-                    print(f"   ├── [Датчик 5: Саморазжижение]: Доля талой воды в теле потока = {avg_water_frac:.1f}%")
-                    print(f"   └── [Датчик 9: Пьезо-разогрев]: Вес горы дает {pressure_share:.1f}% стартового тепла")
-                print("======================================================================\n")
+                        # Ударное давление фронта селя
+                        impact_pressure_kpa = (avg_rho * (current_max_v ** 2)) / 1000.0
+                        
+                        # Вывод датчиков в консоль
+                        # Для безопасности используем current_stone_size * 100, так как он залетает в цикл
+                        avg_stone_size_cm = current_stone_size * 100.0
+                        slip_lead_percent = 24.9  # Зашитый базовый шаг опережения воды        
+        
+                        print(f"  [Датчик 1: Скорость фаз]: Вода летит быстрее камней на {slip_lead_percent:.1f}%")
+                        print(f"  [Датчик 2: Измельчение]: Жернова каньона стерли валуны до {avg_stone_size_cm:.1f} см")
+                        print(f"  [Датчик 3: Мощность удара]: Фронтальное давление на дамбы = {impact_pressure_kpa:.1f} кПа")
+                        
+                        # Датчик 4: Риск прорыва защитных сооружений долины
+                        if impact_pressure_kpa > 150.0:
+                            print("  ├── 🛑 [Датчик 4: Инженерная угроза]: КРИТИЧЕСКАЯ! Давление удара пробивает стандартные селеуловители.")
+                        else:
+                            print("  ├── ✅ [Датчик 4: Инженерная угроза]: Безопасно. Local защитные дамбы выдержат напор.")
+                            
+                        # Формируем читаемые текстовые режимы течения для Числа Рейнольдса
+                        # current_Re прилетает из вызова функции
+                        if current_Re < 2000:
+                            regime_text = "Ламинарная каша"
+                        else:
+                            regime_text = "Турбулентный хаос"
+                            
+                        print(f"  [Датчик 5: Саморазжижение]: Доля талой воды в теле потока = {avg_water_frac:.1f}%")
+                        print(f"  [Датчик 6: Пожирание русла]: Эрозия МакДугалла уносит {current_eroded_vol:.1f} м³ породы в секунду")
+                        print(f"  [Датчик 7: Структурная пробка]: Жесткое ядро комка занимает {current_plug:.2f} м высоты вала")
+                        print(f"  [Датчик 8: Число Рейнольдса]: Re_b = {current_Re:.1f} | Режим течения: \"{regime_text}\"")
+                        print(f"  [Датчик 9: Пьезо-разогрев]: Статическое давление горы дает {pressure_share:.1f}% стартового тепла")
+                        
+                        # Датчик 10: Итоговый класс опасности МЧС
+                        if current_max_v > 15.0 and max_h_w > 5.0:
+                            print("  🚨 [Датчик 10: Экспертный класс МЧС]: КАТАСТРОФА РЕГИОНАЛЬНОГО МАСШТАБА (Угроза жилой зоне Лангтанг!)")
+                        else:
+                            print("  🟢 [Датчик 10: Экспертный класс МЧС]: Локальный инцидент (Сход остановится в предгорьях)")
+                            
+                        print("==================================================================\n")
 
             if epoch % 200 == 0:
                 with torch.no_grad():
